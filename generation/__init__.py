@@ -1,1 +1,1 @@
-from .strategies import BaseStrategy, BeamSearchStrategy
+from .strategies import BaseStrategy, BeamSearchStrategy, ConstraintBeamSearchStrategy
