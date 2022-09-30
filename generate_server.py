@@ -149,7 +149,7 @@ def fill_blanks(raw_text: str, model, tokenizer, strategy) -> Tuple[List[str], L
         seq = seq + [tokenizer.get_command("eos")]
     if mpu.get_model_parallel_rank() == 0:
         print("\nInput: {}\n".format(raw_text))
-    if len(seq) > args.max_sequence_length:
+    if len(seq) > args.max_sequence_length or len(seq) > args.out_seq_length:
         raise ValueError("text too long.")
 
     # generation
@@ -231,31 +231,34 @@ def fill_blanks(raw_text: str, model, tokenizer, strategy) -> Tuple[List[str], L
 
 def process(model, tokenizer, request):
     j = request
-    sampling_strategy = j["sampling_strategy"]
+    args.sampling_strategy = j["sampling_strategy"]
     sentences = j["context"]
+    args.out_seq_length = j.get("out_seq_length", 256)
 
     end_tokens = [tokenizer.get_command("eop"), tokenizer.get_command("eos")]
-    if sampling_strategy == "BaseStrategy":
+    if args.sampling_strategy == "BaseStrategy":
         max_length = j["max_len"]
         args.max_sequence_length = max_length
         temperature = j["temperature"]
         top_k = j["top_k"]
         top_p = j["top_p"]
         strategy = BaseStrategy(temperature=temperature, top_k=top_k, top_p=top_p, end_tokens=end_tokens)
-    elif sampling_strategy == "BeamSearchStrategy":
-        num_beams = j["num_beams"]
+    elif args.sampling_strategy == "BeamSearchStrategy":
+        batch_size = j.get("batch_size", 1)
+        args.num_beams = j["num_beams"]
         length_penalty = j["length_penalty"]
         no_repeat_ngram_size = j["no_repeat_ngram_size"]
         min_gen_length = j["min_gen_length"]
         strategy = BeamSearchStrategy(
-            num_beams,
+            batch_size,
+            args.num_beams,
             length_penalty=length_penalty,
             consider_end=True,
             end_tokens=end_tokens,
             no_repeat_ngram_size=no_repeat_ngram_size,
             min_gen_length=min_gen_length,
         )
-    elif sampling_strategy == "ConstraintBeamSearchStrategy":
+    elif args.sampling_strategy == "ConstraintBeamSearchStrategy":
         num_beams = j["num_beams"]
         length_penalty = j["length_penalty"]
         no_repeat_ngram_size = j["no_repeat_ngram_size"]
@@ -271,7 +274,7 @@ def process(model, tokenizer, request):
             forces_output=forces_output,
         )
     else:
-        return f"unknown strategy {sampling_strategy}", 400
+        return f"unknown strategy {args.sampling_strategy}", 400
 
     answers, answers_with_style, blanks = fill_blanks(sentences, model, tokenizer, strategy)
 
@@ -299,56 +302,6 @@ def main(args):
                 return
 
             process(model, tokenizer, request)
-
-
-    # model, tokenizer = initialize_model_and_tokenizer(args)
-
-    # end_tokens = [tokenizer.get_command("eop"), tokenizer.get_command("eos")]
-
-    # if args.sampling_strategy == "BaseStrategy":
-    #     strategy = BaseStrategy(batch_size=1, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
-    #                             end_tokens=end_tokens)
-    # elif args.sampling_strategy == "BeamSearchStrategy":
-    #     strategy = BeamSearchStrategy(
-    #         1,
-    #         args.num_beams,
-    #         length_penalty=args.length_penalty,
-    #         consider_end=True,
-    #         end_tokens=end_tokens,
-    #         no_repeat_ngram_size=args.no_repeat_ngram_size,
-    #         min_gen_length=args.min_gen_length,
-    #     )
-    # else:
-    #     raise ValueError(f"unknown strategy {args.sampling_strategy}")
-
-    # def process(raw_text):
-    #     if args.with_id:
-    #         query_id, raw_text = raw_text.split("\t")
-
-    #     answers, answers_with_style, blanks = fill_blanks(raw_text, model, tokenizer, strategy)
-
-    #     # save
-    #     if args.with_id:
-    #         full_path = os.path.join(args.output_path, query_id + ".txt")
-    #     else:
-    #         prefix = raw_text.replace("/", "")[:20]
-    #         full_path = timed_name(prefix, ".txt", args.output_path)
-    #     if mpu.get_model_parallel_rank() == 0:
-    #         if args.print_all_beams and len(answers) > 1:
-    #             for idx, answer_with_style in enumerate(answers_with_style):
-    #                 print(f"Output beam {idx}:", answer_with_style)  # print the first.
-    #                 if len(answer_with_style) > 120:
-    #                     print("")
-    #         else:
-    #             print(f"Output:", answers_with_style[0])  # print the first.
-    #         with open(full_path, "w", encoding="utf-8") as fout:
-    #             for answer in answers:
-    #                 fout.write(answer + "\n")
-
-    #         os.chmod(full_path, stat.S_IRWXO + stat.S_IRWXG + stat.S_IRWXU)
-
-    # os.makedirs(args.output_path, exist_ok=True)
-    # generate_continually(process, args.input_source)
 
 
 if __name__ == "__main__":
