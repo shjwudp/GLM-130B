@@ -155,7 +155,7 @@ def fill_blanks(raw_text: str, model, tokenizer, strategy) -> Tuple[List[str], L
     # generation
     is_english = isEnglish(raw_text)
     output_list = [seq]
-    num_output = args.num_beams if args.sampling_strategy == "BeamSearchStrategy" else 1
+    num_output = args.num_beams if args.sampling_strategy == "BeamSearchStrategy" or args.sampling_strategy == "ConstraintBeamSearchStrategy" else 1
     last_pos, answers, answers_with_style, blanks = (
         [0] * num_output,
         ["" for _ in range(num_output)],
@@ -259,13 +259,15 @@ def process(model, tokenizer, request):
             min_gen_length=min_gen_length,
         )
     elif args.sampling_strategy == "ConstraintBeamSearchStrategy":
-        num_beams = j["num_beams"]
+        batch_size = j.get("batch_size", 1)
+        args.num_beams = j["num_beams"]
         length_penalty = j["length_penalty"]
         no_repeat_ngram_size = j["no_repeat_ngram_size"]
         min_gen_length = j["min_gen_length"]
         forces_output = j.get("forces_output", [])
         strategy = ConstraintBeamSearchStrategy(
-            num_beams,
+            batch_size,
+            args.num_beams,
             length_penalty=length_penalty,
             consider_end=True,
             end_tokens=end_tokens,

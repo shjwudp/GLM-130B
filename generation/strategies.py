@@ -193,6 +193,89 @@ class BeamSearchStrategy:
         return ret, mems
 
 
+class TrieNode:
+    """A node in the trie structure"""
+
+    def __init__(self, char):
+        # the character stored in this node
+        self.char = char
+
+        # whether this can be the end of a word
+        self.is_end = False
+
+        # a counter indicating how many times a word is inserted
+        # (if this node's is_end is True)
+        self.counter = 0
+
+        # a dictionary of child nodes
+        # keys are characters, values are nodes
+        self.children = {}
+
+
+class Trie(object):
+    """The trie object"""
+
+    def __init__(self):
+        """
+        The trie has at least the root node.
+        The root node does not store any character
+        """
+        self.root = TrieNode("")
+    
+    def insert(self, word):
+        """Insert a word into the trie"""
+        node = self.root
+        
+        # Loop through each character in the word
+        # Check if there is no child containing the character, create a new child for the current node
+        for char in word:
+            if char in node.children:
+                node = node.children[char]
+            else:
+                # If a character is not found,
+                # create a new node in the trie
+                new_node = TrieNode(char)
+                node.children[char] = new_node
+                node = new_node
+        
+        # Mark the end of a word
+        node.is_end = True
+
+        # Increment the counter to indicate that we see this word once more
+        node.counter += 1
+        
+    def dfs(self, node, prefix):
+        """Depth-first traversal of the trie
+        
+        Args:
+            - node: the node to start with
+            - prefix: the current prefix, for tracing a
+                word while traversing the trie
+        """
+        if node.is_end:
+            self.output.append((prefix + node.char, node.counter))
+        
+        for child in node.children.values():
+            self.dfs(child, prefix + node.char)
+        
+    def query(self, x):
+        """Given an input (a prefix), check if words stored in
+        the trie with that prefix
+        """
+        # Use a variable within the class to keep all possible outputs
+        # As there can be more than one word with such prefix
+        self.output = []
+        node = self.root
+
+        for char in x:
+            if char in node.children:
+                node = node.children[char]
+            else:
+                return False
+
+        return True
+
+
 class ConstraintBeamSearchStrategy:
     """Used in say-can_ application scenarios to score a large number of actions and beam search.
 
@@ -220,6 +303,9 @@ class ConstraintBeamSearchStrategy:
         self.invalid_slices = invalid_slices
         self.consider_end = consider_end
         self.deterministic = deterministic
+        self.forces_output = Trie()
+        for word in forces_output:
+            self.forces_output.insert(word)
         self._init_cache()
 
     def _init_cache(self):
@@ -272,18 +358,30 @@ class ConstraintBeamSearchStrategy:
         probs = F.softmax(next_token_scores, dim=-1)
         if num_beams < self.num_beams:  # First token
             probs = probs[..., :vocab_size]
-        if self.deterministic:
-            next_tokens = torch.topk(probs, k=(max(1, len(self.end_tokens)) + 1) * self.num_beams).indices  # [2*nb]
-        else:
-            next_tokens = torch.multinomial(
-                probs, num_samples=(max(1, len(self.end_tokens)) + 1) * self.num_beams
-            )  # [2*nb]
-        next_token_scores = next_token_scores[torch.arange(batch_size).unsqueeze(1), next_tokens]
-        next_token_scores, _indices = torch.sort(next_token_scores, descending=True, dim=1)
-        next_tokens = next_tokens[torch.arange(batch_size).unsqueeze(1), _indices]
 
-        next_indices = torch.div(next_tokens, vocab_size, rounding_mode="trunc")
-        next_tokens = next_tokens % vocab_size
+        next_indices = probs.flatten().sort(descending=True).indices
+        next_indices = np.array(np.unravel_index(next_indices.numpy(), probs.shape)).T
+        next_tokens = [[] for _ in range(batch_size)]
+        for batch_idx, beam_idx, token_idx in next_indices:
+            generate_tokens = tokens[batch_idx, beam_idx, -self.length_generated:]
+            if self.forces_output.query(generate_tokens):
+                next_tokens[batch_idx].append((beam_idx, token_idx))
+
+        # Align the number of samples per batch
+        num_samples = (max(1, len(self.end_tokens)) + 1) * self.num_beams
+        for batch_idx in range(len(next_tokens)):
+            samples = next_tokens[batch_idx]
+            if len(samples) < num_samples:
+                while len(samples) < num_samples:
+                    samples.append(samples[0])
+
+            if len(samples) > num_samples:
+                if self.deterministic:
+                    samples = samples[:num_samples]
+                else:
+                    raise Exception("Non-deterministic methods have not been implemented.")
+
+            next_tokens[batch_idx] = samples
 
         # select out end beams or continue beams
         beam_continue_batch, score_continue_batch, mems_continue_batch = [], [], []
@@ -293,19 +391,20 @@ class ConstraintBeamSearchStrategy:
             bans_continue = []
             mems_contiue = []
             for i in range(len(next_tokens[batch_idx])):
-                beam = torch.cat((tokens[batch_idx, next_indices[batch_idx, i]], next_tokens[batch_idx, i : i + 1]))
-                if not self._is_done[batch_idx] and int(next_tokens[batch_idx, i]) in self.end_tokens:
+                beam_idx, token_id = next_tokens[batch_idx][i]
+                beam = torch.cat((tokens[batch_idx, beam_idx], torch.tensor([token_id])))
+                if not self._is_done[batch_idx] and int(token_id) in self.end_tokens:
                     self._add_end_beams(next_token_scores[batch_idx, i], beam, batch_idx)
                 elif len(beam_continue) < self.num_beams:
                     beam_continue.append(beam)
-                    mems_contiue.append(mems[:, batch_idx, next_indices[batch_idx, i]])
+                    mems_contiue.append(mems[:, batch_idx, beam_idx])
                     # update caches
                     scores_continue.append(next_token_scores[batch_idx, i])
                     if self.ngram > 0:
-                        bans = self.cached_beam_ngram_bans[batch_idx][next_indices[batch_idx, i]].copy()
+                        bans = self.cached_beam_ngram_bans[batch_idx][beam_idx].copy()
                         # TODO ngram=1
-                        ngram_prefix = tuple(tokens[batch_idx, next_indices[batch_idx, i], -(self.ngram - 1):].tolist())
-                        bans[ngram_prefix] = bans.get(ngram_prefix, tuple()) + (next_tokens[batch_idx, i],)
+                        ngram_prefix = tuple(tokens[batch_idx, beam_idx, -(self.ngram - 1):].tolist())
+                        bans[ngram_prefix] = bans.get(ngram_prefix, tuple()) + (token_id,)
                         bans_continue.append(bans)
                 else:
                     break
