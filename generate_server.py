@@ -291,7 +291,7 @@ def process(model, tokenizer, request):
     try:
         beam_scores = strategy.backup_cached_beam_scores[0] # batch_idx = 0
         beam_probs = torch.nn.functional.softmax(beam_scores, dim=-1)
-        answers = zip(answers, beam_probs)
+        answers = list(zip(answers, beam_probs))
     except:
         pass
 
