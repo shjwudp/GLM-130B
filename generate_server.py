@@ -64,7 +64,7 @@ class GPTGenerate(Resource):
 
             resp = {
                 "prompt": j["context"],
-                "text": "\n".join(answers),
+                "otuput": answers,
                 "compute_time": time.time() - start_timestamp,
             }
 
@@ -264,7 +264,11 @@ def process(model, tokenizer, request):
         length_penalty = j["length_penalty"]
         no_repeat_ngram_size = j["no_repeat_ngram_size"]
         min_gen_length = j["min_gen_length"]
+        deterministic = j.get("deterministic", False)
         forces_output = j.get("forces_output", [])
+        forces_output = [
+            tokenizer.tokenize(word) + [end_tokens[0]] for word in forces_output
+        ]
         strategy = ConstraintBeamSearchStrategy(
             batch_size,
             args.num_beams,
@@ -274,11 +278,22 @@ def process(model, tokenizer, request):
             no_repeat_ngram_size=no_repeat_ngram_size,
             min_gen_length=min_gen_length,
             forces_output=forces_output,
+            deterministic=deterministic,
         )
     else:
         return f"unknown strategy {args.sampling_strategy}", 400
 
-    answers, answers_with_style, blanks = fill_blanks(sentences, model, tokenizer, strategy)
+    try:
+        answers, answers_with_style, blanks = fill_blanks(sentences, model, tokenizer, strategy)
+    except Exception as ex:
+        return f"fill_blanks failed, ex={ex}", 400
+
+    try:
+        beam_scores = strategy.backup_cached_beam_scores[0] # batch_idx = 0
+        beam_probs = torch.nn.functional.softmax(beam_scores, dim=-1)
+        answers = zip(answers, beam_probs)
+    except:
+        pass
 
     return answers, 200
 

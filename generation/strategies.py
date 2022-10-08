@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -360,17 +362,30 @@ class ConstraintBeamSearchStrategy:
             probs = probs[..., :vocab_size]
 
         next_indices = probs.flatten().sort(descending=True).indices
-        next_indices = np.array(np.unravel_index(next_indices.numpy(), probs.shape)).T
+        next_indices = np.array(np.unravel_index(next_indices.cpu().numpy(), probs.shape)).T
+
         next_tokens = [[] for _ in range(batch_size)]
-        for batch_idx, beam_idx, token_idx in next_indices:
-            generate_tokens = tokens[batch_idx, beam_idx, -self.length_generated:]
-            if self.forces_output.query(generate_tokens):
+        generate_tokens = {}
+        for batch_idx in range(batch_size):
+            for beam_idx in range(num_beams):
+                if self.length_generated == 0:
+                    generate_tokens[(batch_idx, beam_idx)] = []
+                else:
+                    generate_tokens[(batch_idx, beam_idx)] = tokens[batch_idx, beam_idx, -self.length_generated:].flatten().cpu().detach().numpy().tolist()
+
+        for batch_idx, idx in next_indices:
+            beam_idx = math.floor(idx / vocab_size)
+            token_idx = idx % vocab_size
+            if self.forces_output.query(generate_tokens[(batch_idx, beam_idx)] + [token_idx]):
                 next_tokens[batch_idx].append((beam_idx, token_idx))
 
         # Align the number of samples per batch
         num_samples = (max(1, len(self.end_tokens)) + 1) * self.num_beams
         for batch_idx in range(len(next_tokens)):
             samples = next_tokens[batch_idx]
+            if len(samples) == 0:
+                samples = [(0, self.end_tokens[0])] * num_samples
+
             if len(samples) < num_samples:
                 while len(samples) < num_samples:
                     samples.append(samples[0])
@@ -379,7 +394,14 @@ class ConstraintBeamSearchStrategy:
                 if self.deterministic:
                     samples = samples[:num_samples]
                 else:
-                    raise Exception("Non-deterministic methods have not been implemented.")
+                    sample_probs = []
+                    for beam_idx, token_idx in samples:
+                        idx = beam_idx * vocab_size + token_idx
+                        sample_probs.append(float(probs[batch_idx, idx]))
+                    sample_probs = torch.Tensor(sample_probs)
+
+                    samples_indices = torch.multinomial(sample_probs, num_samples=num_samples).tolist()
+                    samples = [samples[i] for i in samples_indices]
 
             next_tokens[batch_idx] = samples
 
@@ -392,7 +414,7 @@ class ConstraintBeamSearchStrategy:
             mems_contiue = []
             for i in range(len(next_tokens[batch_idx])):
                 beam_idx, token_id = next_tokens[batch_idx][i]
-                beam = torch.cat((tokens[batch_idx, beam_idx], torch.tensor([token_id])))
+                beam = torch.cat((tokens[batch_idx, beam_idx], torch.tensor([token_id]).cuda()))
                 if not self._is_done[batch_idx] and int(token_id) in self.end_tokens:
                     self._add_end_beams(next_token_scores[batch_idx, i], beam, batch_idx)
                 elif len(beam_continue) < self.num_beams:
@@ -408,6 +430,12 @@ class ConstraintBeamSearchStrategy:
                         bans_continue.append(bans)
                 else:
                     break
+
+            if len(beam_continue) == 0:
+                for batch_idx in range(self.batch_size):
+                    self._is_done[batch_idx] = True
+                return tokens, mems
+
             beam_continue_batch.append(torch.stack(beam_continue))
             mems_continue_batch.append(torch.stack(mems_contiue, dim=1))
             score_continue_batch.append(scores_continue)
@@ -439,5 +467,6 @@ class ConstraintBeamSearchStrategy:
             ret = self.end_beams[:batch_size]
         else:
             ret = tokens
+        self.backup_cached_beam_scores = self.cached_beam_scores
         self._init_cache()
         return ret, mems
