@@ -55,7 +55,7 @@ class BeamSearchStrategy:
         batch_size,
         num_beams,
         length_penalty=1.0,
-        consider_end=False,
+        consider_end=True,
         end_tokens=[],
         invalid_slices=[],
         no_repeat_ngram_size=0,
@@ -288,6 +288,7 @@ class ConstraintBeamSearchStrategy:
         batch_size,
         num_beams,
         length_penalty=1.0,
+        enable_length_penalty=False,
         consider_end=False,
         end_tokens=[],
         invalid_slices=[],
@@ -299,6 +300,7 @@ class ConstraintBeamSearchStrategy:
         self.batch_size = batch_size
         self.num_beams = num_beams
         self.length_penalty = length_penalty
+        self.enable_length_penalty = enable_length_penalty
         self.end_tokens = end_tokens
         self.ngram = no_repeat_ngram_size
         self.min_gen_length = min_gen_length
@@ -319,7 +321,8 @@ class ConstraintBeamSearchStrategy:
         self._is_done = np.zeros(self.batch_size, dtype=np.bool)
 
     def _add_end_beams(self, score, beam, batch_idx):
-        score = score / ((5.0 + len(beam)) / 6) ** self.length_penalty  # Magic number for OpenNMT
+        if self.enable_length_penalty:
+            score = score / ((5.0 + len(beam)) / 6) ** self.length_penalty  # Magic number for OpenNMT
         for i in range(len(self.end_beams[batch_idx]), -1, -1):
             if i == 0 or score < self.end_beams_penalized_scores[batch_idx][i - 1]:
                 break
@@ -465,8 +468,8 @@ class ConstraintBeamSearchStrategy:
                         self._add_end_beams(self.cached_beam_scores[batch_idx, i], tokens[batch_idx, i], batch_idx)
             mems = None
             ret = self.end_beams[:batch_size]
+            self.returned_beam_scores = self.cached_beam_scores[:batch_size]
         else:
             ret = tokens
-        self.backup_cached_beam_scores = self.cached_beam_scores
         self._init_cache()
         return ret, mems

@@ -289,7 +289,7 @@ def process(model, tokenizer, request):
         return f"fill_blanks failed, ex={ex}", 400
 
     try:
-        beam_scores = strategy.backup_cached_beam_scores[0] # batch_idx = 0
+        beam_scores = strategy.returned_beam_scores[0] # batch_idx = 0
         beam_probs = torch.nn.functional.softmax(beam_scores, dim=-1).tolist()
         answers = list(zip(answers, beam_probs))
     except:
