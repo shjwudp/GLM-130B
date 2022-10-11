@@ -12,7 +12,6 @@ from typing import List, Tuple
 from SwissArmyTransformer import mpu
 from evaluation.model import batch_filling_sequence
 from generation import BeamSearchStrategy, BaseStrategy, ConstraintBeamSearchStrategy
-from SwissArmyTransformer.generation.utils import timed_name, generate_continually
 from initialize import initialize, initialize_model_and_tokenizer
 
 from flask import Flask, request, jsonify, current_app, make_response
@@ -266,6 +265,7 @@ def process(model, tokenizer, request):
         min_gen_length = j["min_gen_length"]
         deterministic = j.get("deterministic", False)
         forces_output = j.get("forces_output", [])
+        record_the_inference_process = j.get("record_the_inference_process", False)
         forces_output = [
             tokenizer.tokenize(word) + [end_tokens[0]] for word in forces_output
         ]
@@ -279,6 +279,7 @@ def process(model, tokenizer, request):
             min_gen_length=min_gen_length,
             forces_output=forces_output,
             deterministic=deterministic,
+            record_the_inference_process=record_the_inference_process,
         )
     else:
         return f"unknown strategy {args.sampling_strategy}", 400
@@ -289,7 +290,7 @@ def process(model, tokenizer, request):
         return f"fill_blanks failed, ex={ex}", 400
 
     try:
-        beam_scores = strategy.returned_beam_scores[0] # batch_idx = 0
+        beam_scores = torch.tensor(strategy.returned_beam_scores[0]) # batch_idx = 0
         beam_probs = torch.nn.functional.softmax(beam_scores, dim=-1).tolist()
         answers = list(zip(answers, beam_probs))
     except:

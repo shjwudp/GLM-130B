@@ -1,9 +1,20 @@
 import math
+import time
+import json
+import copy
+from icetk import icetk
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from SwissArmyTransformer.generation.sampling_strategies.base_strategy import top_k_logits
+from numpyencoder import NumpyEncoder
+
+
+def icetk_decode(tokens):
+    tokens = list(filter(lambda x: x not in [150001, 150004, 150005], tokens))
+    return icetk.decode(tokens)
+
 
 class BaseStrategy:
     def __init__(self, batch_size, invalid_slices=[], temperature=1., top_k=200, eps=1e-4, top_p=0.0, end_tokens=None):
@@ -296,6 +307,7 @@ class ConstraintBeamSearchStrategy:
         min_gen_length=0,
         deterministic=False,
         forces_output=[],
+        record_the_inference_process=False,
     ):
         self.batch_size = batch_size
         self.num_beams = num_beams
@@ -308,6 +320,7 @@ class ConstraintBeamSearchStrategy:
         self.consider_end = consider_end
         self.deterministic = deterministic
         self.forces_output = Trie()
+        self.record_the_inference_process= record_the_inference_process
         for word in forces_output:
             self.forces_output.insert(word)
         self._init_cache()
@@ -319,6 +332,7 @@ class ConstraintBeamSearchStrategy:
         self.cached_beam_ngram_bans = [[{} for _ in range(self.num_beams)] for _ in range(self.batch_size)]
         self.length_generated = 0
         self._is_done = np.zeros(self.batch_size, dtype=np.bool)
+        self.record = []
 
     def _add_end_beams(self, score, beam, batch_idx):
         if self.enable_length_penalty:
@@ -376,16 +390,41 @@ class ConstraintBeamSearchStrategy:
                 else:
                     generate_tokens[(batch_idx, beam_idx)] = tokens[batch_idx, beam_idx, -self.length_generated:].flatten().cpu().detach().numpy().tolist()
 
+        record_next_token_scores = [[] for _ in range(batch_size)]
         for batch_idx, idx in next_indices:
             beam_idx = math.floor(idx / vocab_size)
             token_idx = idx % vocab_size
             if self.forces_output.query(generate_tokens[(batch_idx, beam_idx)] + [token_idx]):
                 next_tokens[batch_idx].append((beam_idx, token_idx))
+                idx = beam_idx * vocab_size + token_idx
+                record_next_token_scores[batch_idx].append(float(next_token_scores[batch_idx, idx]))
+
+        record_tokens = tokens.tolist()
+        try:
+            record_score = self.cached_beam_scores.tolist()
+        except:
+            record_score = float(0.)
+
+        self.record.append({
+            "tokens": record_tokens,
+            "scores": record_score,
+            "next_tokens": copy.deepcopy(next_tokens),
+            "record_next_token_scores": record_next_token_scores,
+        })
 
         # Align the number of samples per batch
         num_samples = (max(1, len(self.end_tokens)) + 1) * self.num_beams
         for batch_idx in range(len(next_tokens)):
             samples = next_tokens[batch_idx]
+
+            # Add end beams
+            for rank, (beam_idx, token_id) in enumerate(samples):
+                idx = beam_idx * vocab_size + token_id
+                beam_score = next_token_scores[batch_idx, idx]
+                beam = torch.cat((tokens[batch_idx, beam_idx], torch.tensor([token_id]).cuda()))
+                if int(token_id) in self.end_tokens:
+                    self._add_end_beams(beam_score, beam, batch_idx)
+
             if len(samples) == 0:
                 samples = [(0, self.end_tokens[0])] * num_samples
 
@@ -417,14 +456,16 @@ class ConstraintBeamSearchStrategy:
             mems_contiue = []
             for i in range(len(next_tokens[batch_idx])):
                 beam_idx, token_id = next_tokens[batch_idx][i]
+                idx = beam_idx * vocab_size + token_id
+                beam_score = next_token_scores[batch_idx, idx]
                 beam = torch.cat((tokens[batch_idx, beam_idx], torch.tensor([token_id]).cuda()))
                 if not self._is_done[batch_idx] and int(token_id) in self.end_tokens:
-                    self._add_end_beams(next_token_scores[batch_idx, i], beam, batch_idx)
+                    self._add_end_beams(beam_score, beam, batch_idx)
                 elif len(beam_continue) < self.num_beams:
                     beam_continue.append(beam)
                     mems_contiue.append(mems[:, batch_idx, beam_idx])
                     # update caches
-                    scores_continue.append(next_token_scores[batch_idx, i])
+                    scores_continue.append(beam_score)
                     if self.ngram > 0:
                         bans = self.cached_beam_ngram_bans[batch_idx][beam_idx].copy()
                         # TODO ngram=1
@@ -448,12 +489,15 @@ class ConstraintBeamSearchStrategy:
         self.cached_beam_scores = torch.tensor(score_continue_batch, device=logits.device)
         self.length_generated += 1
         for batch_idx in range(self.batch_size):
+            if self.enable_length_penalty:
+                cached_beam_score = self.cached_beam_scores[batch_idx].max() / ((5.0 + (seq_len + 1)) / 6) ** self.length_penalty
+            else:
+                cached_beam_score = self.cached_beam_scores[batch_idx].max()
             if batch_idx >= batch_size:
                 self._is_done[batch_idx] = True
             elif (
                 len(self.end_beams[batch_idx]) == self.num_beams
-                and self.end_beams_penalized_scores[batch_idx][-1]
-                >= self.cached_beam_scores[batch_idx].max() / ((5.0 + (seq_len + 1)) / 6) ** self.length_penalty
+                and self.end_beams_penalized_scores[batch_idx][-1] >= cached_beam_score
             ):  # We're done if none of current tokens will better than the worst in end_beams
                 self._is_done[batch_idx] = True
 
@@ -468,8 +512,14 @@ class ConstraintBeamSearchStrategy:
                         self._add_end_beams(self.cached_beam_scores[batch_idx, i], tokens[batch_idx, i], batch_idx)
             mems = None
             ret = self.end_beams[:batch_size]
-            self.returned_beam_scores = self.cached_beam_scores[:batch_size]
+            self.returned_beam_scores = self.end_beams_penalized_scores[:batch_size]
         else:
             ret = tokens
+
+        # dump record
+        if self.record_the_inference_process and torch.distributed.get_rank() == 0:
+            timestr = time.strftime("%Y%m%d-%H%M%S")
+            print(json.dumps(self.record, cls=NumpyEncoder), file=open(f"./record/{timestr}.json", "w"))
+
         self._init_cache()
         return ret, mems
